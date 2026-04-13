@@ -307,8 +307,16 @@ def run_optimizer(
             n_accepted = int(np.sum(accepted))
             n_converged = int(np.sum(converged))
             n_valid = int(np.sum(s['n_attempts_map'] >= 0))
-            n_remaining = n_valid - n_accepted - int(np.sum(
-                s['n_attempts_map'] >= s.get('max_attempts', 4)))
+            # Fix: a point accepted on its first attempt has n_attempts==1,
+            # which trips `>= max_attempts` when max_attempts==1. Without
+            # masking out accepted points, n_remaining goes negative.
+            max_attempts_local = s.get('max_attempts', 4)
+            attempts_exhausted = s['n_attempts_map'] >= max_attempts_local
+            if accepted.shape == attempts_exhausted.shape:
+                exhausted = attempts_exhausted & ~accepted
+            else:
+                exhausted = attempts_exhausted
+            n_remaining = n_valid - n_accepted - int(np.sum(exhausted))
             n_timeouts = int(s['timeout_map'].sum())
             print(f"[{elapsed:6.0f}s] "
                   f"accepted={n_accepted}/{n_valid}  "
