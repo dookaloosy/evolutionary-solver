@@ -198,6 +198,7 @@ def run_optimizer(
     on_generation=None,
     n_basins=1,
     problem=None,
+    seed_candidates=None,
 ):
     """Run evolutionary optimization.
 
@@ -283,9 +284,23 @@ def run_optimizer(
         best_fitness_history = []
 
         # ── Initialize population ────────────────────────────────────────
-        print(f"Initializing population: {pop_size} candidates")
-        population = init_population(evolved_params, pop_size, fixed_params,
+        n_seeds = 0
+        if seed_candidates:
+            n_seeds = len(seed_candidates)
+            for si, seed in enumerate(seed_candidates):
+                full = dict(fixed_params)
+                full.update(seed)
+                candidates_all.append(
+                    _make_candidate(f'gen00_cand{si:02d}', seed, full))
+            print(f"Seeded {n_seeds} candidate(s) into initial population")
+        n_random = pop_size - n_seeds
+        print(f"Initializing population: {n_random} random + {n_seeds} seeded "
+              f"= {pop_size} candidates")
+        population = init_population(evolved_params, n_random, fixed_params,
                                      problem=problem)
+        # Re-number random candidates to follow seeds.
+        for ri, cand in enumerate(population):
+            cand['id'] = f'gen00_cand{n_seeds + ri:02d}'
         candidates_all.extend(population)
         state['candidates'] = candidates_all
         save_state(state, run_dir)

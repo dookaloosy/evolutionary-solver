@@ -47,6 +47,12 @@ state = run_optimizer(
     fine_step_0=25e-6, fine_step_1=10e-6,
     fine_margin_0=100e-6, fine_margin_1=40e-6,
     problem=problem,
+    # Optional: warm-start with known-good genomes. Each dict maps
+    # evolved-param names to values. Seeds occupy gen0 slots
+    # `cand00..cand{N-1}`; LHS random candidates fill the rest.
+    seed_candidates=[
+        {'ax0': 1.23e-3, 'ax1': 4.56e-4},
+    ],
 )
 ```
 
