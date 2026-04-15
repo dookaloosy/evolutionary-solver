@@ -238,14 +238,54 @@ def _adjacent(idx, shape):
 
 
 def _chebyshev_shell(center, r, shape):
-    """Yield all indices at Chebyshev distance exactly *r* from *center*."""
+    """Yield all in-bounds indices at Chebyshev distance exactly *r* from *center*.
+
+    Enumerates the shell surface directly rather than iterating the full
+    (2r+1)^ndim cube and filtering — for each axis k and sign ±, fix
+    offsets[k] = ±r, let the other axes range over [-r, r], and dedupe
+    corners/edges via a set. Shell size ≈ 2·ndim·(2r+1)^(ndim-1); total
+    work across r = 1..R telescopes to (2R+1)^ndim rather than the sum
+    of cubes it used to be.
+
+    Savings are largest in low dimensions (2-3 axes: ~2× speedup over
+    the cube-and-filter loop) and shrink as N grows (at N ≥ 5 the shell
+    IS most of the cube).
+
+    TODO(high-N seeding): the shell surface itself is ~(2r+1)^(ndim-1)
+    — exponential in ndim. Beyond ~4 search axes, grid-shell enumeration
+    for continuation seeding (find_nearest_seed) becomes intractable
+    regardless of how efficient this generator is. Switch to a proper
+    nearest-neighbour data structure (KD-tree over accepted points,
+    Poisson-disk sampling, or a sparse index) before extending this
+    engine to 5+ axes. This rewrite only buys headroom; it does not
+    fix the asymptotic scaling.
+    """
     ndim = len(center)
-    for offsets in iproduct(range(-r, r + 1), repeat=ndim):
-        if max(abs(o) for o in offsets) != r:
-            continue
-        new = tuple(c + o for c, o in zip(center, offsets))
-        if all(0 <= new[d] < shape[d] for d in range(ndim)):
-            yield new
+    if ndim == 0 or r == 0:
+        if all(0 <= center[d] < shape[d] for d in range(ndim)):
+            yield tuple(center)
+        return
+    seen = set()
+    for k in range(ndim):
+        for sign in (-1, 1):
+            fixed = center[k] + sign * r
+            if not (0 <= fixed < shape[k]):
+                continue
+            # Other axes sweep the full [-r, r] range; dedup via `seen`
+            # handles corners where two+ axes both sit at ±r.
+            ranges = []
+            for j in range(ndim):
+                if j == k:
+                    ranges.append((fixed,))
+                else:
+                    lo = max(0, center[j] - r)
+                    hi = min(shape[j] - 1, center[j] + r)
+                    ranges.append(tuple(range(lo, hi + 1)))
+            for combo in iproduct(*ranges):
+                if combo in seen:
+                    continue
+                seen.add(combo)
+                yield combo
 
 
 def _all_indices(shape):

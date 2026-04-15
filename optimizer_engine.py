@@ -181,10 +181,8 @@ def run_optimizer(
     fixed_params,
     evolved_params,
     grid_resolution,
-    fine_step_0,
-    fine_step_1,
-    fine_margin_0,
-    fine_margin_1,
+    fine_steps,
+    fine_margins,
     run_name=None,
     pop_size=8,
     max_generations=20,
@@ -209,20 +207,35 @@ def run_optimizer(
     grid_resolution : float — minimum quantization step for grid axes
         (e.g. 1e-6 for um-scale, 1e-9 for nm-scale problems). Used to
         snap grid points and avoid float aliasing on resume.
-    fine_step_0, fine_step_1 : float — fine-scan step size for axes 0/1
-    fine_margin_0, fine_margin_1 : float — fine-scan zoom half-width for axes 0/1
+    fine_steps : dict[str, float] — fine-scan step size, keyed by axis
+        name. Must provide a value for every axis in
+        ``problem.axis_names()``. Sub-sweep dimensionality follows the
+        length of this dict.
+    fine_margins : dict[str, float] — fine-scan zoom half-width,
+        keyed by axis name. Same keying requirement as ``fine_steps``.
     problem : Problem — domain adapter (must have .name set)
     """
-    if any(v is None for v in (grid_resolution, fine_step_0, fine_step_1,
-                                fine_margin_0, fine_margin_1)):
+    if grid_resolution is None or fine_steps is None or fine_margins is None:
         raise ValueError(
-            'run_optimizer requires grid_resolution and all four of '
-            'fine_step_0, fine_step_1, fine_margin_0, fine_margin_1')
+            'run_optimizer requires grid_resolution, fine_steps, and '
+            'fine_margins')
     # Get axis names from problem
     problem.prepare(fixed_params)
     axis_names_list = problem.axis_names()
     axis_meta = problem.axis_metadata()
-    a0, a1 = axis_names_list[0], axis_names_list[1]
+
+    # Validate that fine_steps / fine_margins cover every axis the problem
+    # exposes. Extra keys are tolerated but warned about; missing keys are
+    # a hard error.
+    _expected = set(axis_names_list)
+    missing_steps = _expected - set(fine_steps)
+    missing_margins = _expected - set(fine_margins)
+    if missing_steps or missing_margins:
+        raise ValueError(
+            f"fine_steps / fine_margins must cover every axis returned by "
+            f"problem.axis_names() = {axis_names_list}. "
+            f"Missing in fine_steps: {sorted(missing_steps)}; "
+            f"missing in fine_margins: {sorted(missing_margins)}")
 
     import threading
     _state_lock = threading.Lock()
@@ -242,10 +255,8 @@ def run_optimizer(
         # Reproducibility: saved grid/step values win over runtime args
         saved = state['settings']
         grid_resolution = saved['grid_resolution']
-        fine_step_0 = saved[f'fine_step_{a0}']
-        fine_step_1 = saved[f'fine_step_{a1}']
-        fine_margin_0 = saved[f'fine_margin_{a0}']
-        fine_margin_1 = saved[f'fine_margin_{a1}']
+        fine_steps = {ax: saved[f'fine_step_{ax}'] for ax in axis_names_list}
+        fine_margins = {ax: saved[f'fine_margin_{ax}'] for ax in axis_names_list}
         # Update settings with current runtime values
         state['settings'].update({
             'max_generations': max_generations,
@@ -264,11 +275,9 @@ def run_optimizer(
                 'pop_size': pop_size,
                 'max_generations': max_generations,
                 'grid_resolution': grid_resolution,
-                f'fine_step_{a0}': fine_step_0,
-                f'fine_step_{a1}': fine_step_1,
+                **{f'fine_step_{ax}': fine_steps[ax] for ax in axis_names_list},
                 'coarse_factor': coarse_factor,
-                f'fine_margin_{a0}': fine_margin_0,
-                f'fine_margin_{a1}': fine_margin_1,
+                **{f'fine_margin_{ax}': fine_margins[ax] for ax in axis_names_list},
                 'acceptance_threshold': acceptance_threshold,
                 'max_attempts': max_attempts,
                 'max_concurrent': max_concurrent,
@@ -410,13 +419,11 @@ def run_optimizer(
                 cand['coarse_fitness'] = 1e6
                 continue
 
-            coarse_step_0 = fine_step_0 * coarse_factor
-            coarse_step_1 = fine_step_1 * coarse_factor
             coarse_searched = OrderedDict([
-                (a0, make_grid(vr[f'{a0}_min'], vr[f'{a0}_max'], coarse_step_0,
-                               grid_resolution)),
-                (a1, make_grid(vr[f'{a1}_min'], vr[f'{a1}_max'], coarse_step_1,
-                               grid_resolution)),
+                (ax, make_grid(
+                    vr[f'{ax}_min'], vr[f'{ax}_max'],
+                    fine_steps[ax] * coarse_factor, grid_resolution))
+                for ax in axis_names_list
             ])
 
             if any(len(a) < 2 for a in coarse_searched.values()):
@@ -430,13 +437,17 @@ def run_optimizer(
             cand['output_dir'] = os.path.join(
                 run_dir, f"{cand['id']}_{config_hash}")
 
-            ax0_arr = coarse_searched[a0]
-            ax1_arr = coarse_searched[a1]
-            r0 = problem.format_bounds(a0, vr[f'{a0}_min'], vr[f'{a0}_max'])
-            r1 = problem.format_bounds(a1, vr[f'{a1}_min'], vr[f'{a1}_max'])
-            print(f"  {cand['id']}: valid {r0}, {r1}  "
-                  f"({len(ax0_arr)}x{len(ax1_arr)} = "
-                  f"{len(ax0_arr)*len(ax1_arr)} pts)")
+            range_strs = [
+                problem.format_bounds(ax, vr[f'{ax}_min'], vr[f'{ax}_max'])
+                for ax in axis_names_list
+            ]
+            grid_sizes = [len(coarse_searched[ax]) for ax in axis_names_list]
+            n_pts = 1
+            for s in grid_sizes:
+                n_pts *= s
+            print(f"  {cand['id']}: valid {', '.join(range_strs)}  "
+                  f"({' × '.join(str(s) for s in grid_sizes)} = "
+                  f"{n_pts} pts)")
             pending.append((cand, coarse_searched))
 
         # Run coarse scans in parallel batches (acceptance=0, coarser resolution, temp dir)
@@ -482,9 +493,17 @@ def run_optimizer(
                     cand = futures.pop(fut)
                     _, stats = fut.result()
 
-                    # Extract top-K basins from coarse results
-                    _min_sep = max(2, int(fine_margin_0 /
-                            (fine_step_0 * coarse_factor)))
+                    # Extract top-K basins from coarse results. The
+                    # min_separation is a Chebyshev distance in coarse
+                    # grid cells (see sweep_engine.extract_basins). Take
+                    # the conservative (smallest) per-axis value so
+                    # basins are well-separated in every dimension —
+                    # the pre-0.2.0 code used only axis 0 and had a
+                    # latent bug when axes had dissimilar scales.
+                    _min_sep = max(2, min(
+                        int(fine_margins[ax] / (fine_steps[ax] * coarse_factor))
+                        for ax in axis_names_list
+                    ))
                     basins_raw = problem.fitness_basins(
                         stats, acceptance_threshold=0,
                         n_basins=n_basins, min_separation=_min_sep)
@@ -510,10 +529,13 @@ def run_optimizer(
                         ]
                         cand['status'] = 'coarse_done'
                         _shared_tick_cb.clear_spinner()
-                        v0 = problem.format_point(a0, best_pt[a0])
-                        v1 = problem.format_point(a1, best_pt[a1])
+                        pt_strs = [
+                            problem.format_point(ax, best_pt[ax])
+                            for ax in axis_names_list
+                        ]
                         print(f"  {cand['id']}: coarse fitness = "
-                              f"{problem.format_fitness(alpha)} at {v0}, {v1}"
+                              f"{problem.format_fitness(alpha)} "
+                              f"at {', '.join(pt_strs)}"
                               f" ({len(basins_raw)} basin(s))")
                     state['candidates'] = candidates_all
                     with _state_lock:
@@ -547,13 +569,12 @@ def run_optimizer(
         def _make_basin_fine_axes(basin, vr):
             """Build fine-scan axes zoomed around a basin center."""
             center = basin['center']
-            v0_lo = max(center[a0] - fine_margin_0, vr[f'{a0}_min'])
-            v0_hi = min(center[a0] + fine_margin_0, vr[f'{a0}_max'])
-            v1_lo = max(center[a1] - fine_margin_1, vr[f'{a1}_min'])
-            v1_hi = min(center[a1] + fine_margin_1, vr[f'{a1}_max'])
             return OrderedDict([
-                (a0, make_grid(v0_lo, v0_hi, fine_step_0, grid_resolution)),
-                (a1, make_grid(v1_lo, v1_hi, fine_step_1, grid_resolution)),
+                (ax, make_grid(
+                    max(center[ax] - fine_margins[ax], vr[f'{ax}_min']),
+                    min(center[ax] + fine_margins[ax], vr[f'{ax}_max']),
+                    fine_steps[ax], grid_resolution))
+                for ax in axis_names_list
             ])
 
         # Build flat list of (cand, basin_idx, fine_axes) jobs
@@ -572,15 +593,20 @@ def run_optimizer(
                     continue
                 fine_searched = _make_basin_fine_axes(basin, vr)
                 basin['output_dir'] = cand['output_dir'] + f'_basin{bi}'
-                ax0_f, ax1_f = fine_searched[a0], fine_searched[a1]
                 _shared_tick_cb.clear_spinner()
                 center = basin['center']
-                c0_str = problem.format_point(a0, center[a0])
-                c1_str = problem.format_point(a1, center[a1])
+                fine_sizes = [len(fine_searched[ax]) for ax in axis_names_list]
+                n_fine_pts = 1
+                for s in fine_sizes:
+                    n_fine_pts *= s
+                center_strs = [
+                    problem.format_point(ax, center[ax])
+                    for ax in axis_names_list
+                ]
                 print(f"  {cand['id']} basin{bi}: fine scan "
-                      f"{len(ax0_f)}x{len(ax1_f)} = "
-                      f"{len(ax0_f)*len(ax1_f)} pts "
-                      f"(zoom around {c0_str}, {c1_str})")
+                      f"{' × '.join(str(s) for s in fine_sizes)} = "
+                      f"{n_fine_pts} pts "
+                      f"(zoom around {', '.join(center_strs)})")
                 fine_pending.append((cand, bi, fine_searched))
 
         def _run_fine(cand, basin_idx, fine_searched):
@@ -707,8 +733,10 @@ def run_optimizer(
         print(f"  Params: {best['evolved_values']}")
         if best.get('best_point'):
             bp = best['best_point']
-            print(f"  At {problem.format_point(a0, bp[a0])}, "
-                  f"{problem.format_point(a1, bp[a1])}")
+            pt_strs = [
+                problem.format_point(ax, bp[ax]) for ax in axis_names_list
+            ]
+            print(f"  At {', '.join(pt_strs)}")
 
         save_state(state, run_dir)
         save_summary(state, run_dir)
@@ -782,8 +810,10 @@ def run_optimizer(
         print(f"Outer params: {overall_best['evolved_values']}")
         if overall_best.get('best_point'):
             bp = overall_best['best_point']
-            print(f"Best {problem.format_point(a0, bp[a0])}, "
-                  f"{problem.format_point(a1, bp[a1])}")
+            pt_strs = [
+                problem.format_point(ax, bp[ax]) for ax in axis_names_list
+            ]
+            print(f"Best {', '.join(pt_strs)}")
         print(f"Output: {overall_best['output_dir']}")
 
     return state
