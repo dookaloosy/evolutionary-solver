@@ -419,12 +419,18 @@ def run_optimizer(
                 cand['coarse_fitness'] = 1e6
                 continue
 
-            coarse_searched = OrderedDict([
-                (ax, make_grid(
+            # Snap coarse-grid points to multiples of the coarse step so the
+            # grid sits on clean stride boundaries (e.g. 20, 30, 40 instead
+            # of 17.458, 27.458, …). Clip after snapping in case the round
+            # pushes the first/last point outside the valid range.
+            coarse_searched = OrderedDict()
+            for ax in axis_names_list:
+                coarse_step = fine_steps[ax] * coarse_factor
+                arr = make_grid(
                     vr[f'{ax}_min'], vr[f'{ax}_max'],
-                    fine_steps[ax] * coarse_factor, grid_resolution))
-                for ax in axis_names_list
-            ])
+                    coarse_step, coarse_step)
+                arr = arr[(arr >= vr[f'{ax}_min']) & (arr <= vr[f'{ax}_max'])]
+                coarse_searched[ax] = arr
 
             if any(len(a) < 2 for a in coarse_searched.values()):
                 print(f"  {cand['id']}: valid range too small — culled")
