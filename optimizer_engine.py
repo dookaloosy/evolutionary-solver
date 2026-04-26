@@ -432,8 +432,8 @@ def run_optimizer(
                 arr = arr[(arr >= vr[f'{ax}_min']) & (arr <= vr[f'{ax}_max'])]
                 coarse_searched[ax] = arr
 
-            if any(len(a) < 2 for a in coarse_searched.values()):
-                print(f"  {cand['id']}: valid range too small — culled")
+            if any(len(a) == 0 for a in coarse_searched.values()):
+                print(f"  {cand['id']}: valid range empty — culled")
                 cand['status'] = 'culled'
                 cand['coarse_fitness'] = 1e6
                 continue
@@ -599,12 +599,22 @@ def run_optimizer(
                     continue
                 fine_searched = _make_basin_fine_axes(basin, vr)
                 basin['output_dir'] = cand['output_dir'] + f'_basin{bi}'
-                _shared_tick_cb.clear_spinner()
                 center = basin['center']
                 fine_sizes = [len(fine_searched[ax]) for ax in axis_names_list]
                 n_fine_pts = 1
                 for s in fine_sizes:
                     n_fine_pts *= s
+
+                if n_fine_pts <= 1:
+                    basin['fine_fitness'] = basin['coarse_fitness']
+                    basin['best_point'] = basin['center']
+                    basin['status'] = 'fine_done'
+                    _shared_tick_cb.clear_spinner()
+                    print(f"  {cand['id']} basin{bi}: fine grid 1×1 — "
+                          f"promoted coarse result")
+                    continue
+
+                _shared_tick_cb.clear_spinner()
                 center_strs = [
                     problem.format_point(ax, center[ax])
                     for ax in axis_names_list
@@ -614,6 +624,17 @@ def run_optimizer(
                       f"{n_fine_pts} pts "
                       f"(zoom around {', '.join(center_strs)})")
                 fine_pending.append((cand, bi, fine_searched))
+
+            # If all basins were promoted (no fine jobs queued), finalize now.
+            if all(b['status'] == 'fine_done' for b in basins):
+                done_basins = [b for b in basins
+                               if b.get('fine_fitness') is not None]
+                if done_basins:
+                    best_b = min(done_basins,
+                                 key=lambda b: b['fine_fitness'])
+                    cand['fine_fitness'] = best_b['fine_fitness']
+                    cand['best_point'] = best_b['best_point']
+                cand['status'] = 'fine_done'
 
         def _run_fine(cand, basin_idx, fine_searched):
             problem.prepare(cand['full_params'])
