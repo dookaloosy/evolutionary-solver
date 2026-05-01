@@ -545,6 +545,8 @@ def run_sweep(
                     row_vals += [oor.get(rn, '') for rn in rnames]
                     row_vals += [oor.get('n_attempts', '')]
                     writer.writerow(row_vals)
+                f.flush()
+                os.fsync(f.fileno())
             shutil.move(tmp_path, results_file)
         except BaseException:
             os.unlink(tmp_path)

@@ -138,6 +138,8 @@ def save_state(state, run_dir):
 
     with open(tmp, 'w') as f:
         json_mod.dump(state, f, indent=2, default=_default)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
@@ -153,7 +155,8 @@ def load_state(run_dir):
 def save_summary(state, run_dir):
     """Write summary.csv: one row per generation with best fitness."""
     path = os.path.join(run_dir, 'summary.csv')
-    with open(path, 'w') as f:
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
         f.write('generation,best_coarse,best_fine,best_candidate,best_params\n')
         for gen_info in state.get('generation_history', []):
             f.write(f"{gen_info['generation']},"
@@ -161,6 +164,9 @@ def save_summary(state, run_dir):
                     f"{gen_info.get('best_fine', '')},"
                     f"{gen_info.get('best_id', '')},"
                     f"\"{gen_info.get('best_outer', '')}\"\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def find_winner(state):
@@ -556,8 +562,11 @@ def run_optimizer(
                     break  # back to as_completed
 
         # ── Rank by coarse fitness, select top 50% for fine scan ─────────
+        # Include fine_done candidates so they participate in survivor
+        # selection and parent ranking after a mid-generation resume.
         coarse_ranked = sorted(
-            [c for c in gen_candidates if c['status'] == 'coarse_done'],
+            [c for c in gen_candidates
+             if c['status'] in ('coarse_done', 'fine_done')],
             key=lambda c: c['coarse_fitness'])
 
         n_survivors = max(2, len(coarse_ranked) // 2)

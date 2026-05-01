@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-04-30
+
+### Fixed
+- Resume bug: candidates that completed fine scanning before a
+  mid-generation interrupt were excluded from `coarse_ranked` (filtered
+  on `status == 'coarse_done'` only). After resume, these candidates
+  were missing from survivor selection and parent breeding, so their
+  genes never propagated. The generation history also reported 1e6
+  (penalty) as the best fitness despite a real winner existing. Now
+  includes `fine_done` candidates in the coarse ranking.
+- Atomic-write hardening: `save_state`, `save_summary`, and sweep
+  results CSV now `fsync` before `os.replace` to prevent partial writes
+  on crash/power-loss (WSL2 observed).
+
 ## [0.2.2] — 2026-04-26
 
 ### Fixed
@@ -95,6 +109,7 @@ Initial public release.
 - Per-run `optimizer_state.json` checkpoint format with full provenance
   (settings, candidates, generation history, fitness trajectory).
 
+[0.2.3]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.3
 [0.2.2]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.2
 [0.2.1]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.1
 [0.2.0]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.0
