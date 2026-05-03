@@ -358,10 +358,17 @@ def make_grid(start, stop, step, grid_resolution):
 
     Snapping prevents float drift between independent runs from
     aliasing the same logical grid point to slightly different values
-    on resume.
+    on resume.  Start/stop are snapped outward (floor/ceil) so that
+    unaligned margins don't collapse interior points.
     """
+    if start == stop:
+        return np.array([start])
+    import math
+    start = math.floor(start / grid_resolution) * grid_resolution
+    stop = math.ceil(stop / grid_resolution) * grid_resolution
     arr = np.arange(start, stop + step * 0.5, step)
-    return np.round(arr / grid_resolution) * grid_resolution
+    snapped = np.round(arr / grid_resolution) * grid_resolution
+    return np.unique(snapped)
 
 
 def _row_to_idx(row, axis_names_list, axis_arrays, grid_resolution):

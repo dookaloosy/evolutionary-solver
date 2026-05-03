@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-05-03
+
+### Fixed
+- `make_grid`: single-point ranges (`start == stop`) now return
+  `[start]` directly, bypassing snap-to-resolution that could round
+  the value outside the valid range and produce an empty grid.
+- `make_grid`: snap start/stop outward (floor/ceil to
+  `grid_resolution`) before `arange`, then `np.unique` to deduplicate.
+  Unaligned fine margins (e.g. ±2.5° with 1.0° resolution) produced
+  half-step values that snapped to duplicates, collapsing 6 grid
+  points to 3.
+
 ## [0.2.3] — 2026-04-30
 
 ### Fixed
@@ -109,6 +121,7 @@ Initial public release.
 - Per-run `optimizer_state.json` checkpoint format with full provenance
   (settings, candidates, generation history, fitness trajectory).
 
+[0.2.4]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.4
 [0.2.3]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.3
 [0.2.2]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.2
 [0.2.1]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.1
