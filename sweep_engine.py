@@ -134,6 +134,28 @@ class Problem:
         """Extract top-K basins as list of (fitness, best_point) tuples."""
         raise NotImplementedError
 
+    # ── Basin refinement ────────────────────────────────────────────────
+
+    def refine_basin(self, center, bounds, output_dir):
+        """Refine a basin center via continuous optimization.
+
+        Called during the fine phase for each basin identified by the
+        coarse sweep.  Subclasses may override to replace the default
+        fine-grid sweep with a gradient-free optimizer (e.g. Nelder-Mead).
+
+        Parameters
+        ----------
+        center : dict — axis_name → value at the basin center.
+        bounds : dict — axis_name → (lo, hi) search bounds.
+        output_dir : str — directory for intermediate results.
+
+        Returns
+        -------
+        (fitness, best_point_dict) on success, or None to fall back
+        to the default fine-grid sweep.
+        """
+        return None
+
     # ── Seeding ──────────────────────────────────────────────────────────
 
     def seed(self):
@@ -199,6 +221,23 @@ class Problem:
     def format_bounds(self, name, lo, hi, unit=''):
         """Format axis bounds for display."""
         return f'{name}=[{lo}, {hi}]'
+
+    def format_best_point(self, best_point):
+        """Format refined parameters for display after basin refinement.
+
+        Returns a parenthesised summary string, or empty string if the
+        problem has nothing extra to show.
+        """
+        return ''
+
+    def describe_candidate(self, cand):
+        """One-line summary of a candidate's evolved values for display.
+
+        Called by the optimizer engine when printing candidate info.
+        *cand* is the full candidate dict (has 'evolved_values',
+        'full_params', 'id', etc.).  Return empty string to suppress.
+        """
+        return ''
 
     # ── Optimizer helpers ────────────────────────────────────────────────
 

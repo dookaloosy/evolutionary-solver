@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] — 2026-05-12
+
+### Added
+- `Problem.refine_basin(center, bounds, output_dir)` — optional method
+  for continuous basin refinement (e.g. Nelder-Mead). Returns
+  `(fitness, best_point)` or `None` to fall back to the fine-grid sweep.
+  Default implementation returns `None` (no new dependencies).
+- `Problem.format_best_point(best_point)` — optional display method
+  for refined parameter summaries. Default returns empty string.
+- `Problem.describe_candidate(cand)` — optional one-line summary of
+  a candidate's evolved values for display. Default returns empty string.
+- 0-axis sweep support: problems with no searched axes (all parameters
+  evolved by the GA) evaluate a single point per candidate.
+
+### Fixed
+- Coarse sweep and basin extraction now use the caller-provided
+  `acceptance_threshold` instead of hardcoding 0. Previously, basins
+  could form around zero-throughput coarse grid points, wasting
+  compute on refinement of infeasible candidates.
+- Penalty candidates (`coarse_fitness >= 1e6`) excluded from survivor
+  selection. Previously the `max(2, …)` floor could promote penalty
+  candidates into the refinement phase, wasting compute on infeasible
+  designs.
+- Per-basin penalty skip: basins with `coarse_fitness >= 1e6` skip
+  the fine-grid sweep entirely.
+- Gaussian mutation for self-breed: when only one parent survives,
+  continuous params get Gaussian noise (σ = 10% of range width)
+  instead of producing identical clones (BLX-α with d=0).
+
 ## [0.2.4] — 2026-05-03
 
 ### Fixed
@@ -121,6 +150,7 @@ Initial public release.
 - Per-run `optimizer_state.json` checkpoint format with full provenance
   (settings, candidates, generation history, fitness trajectory).
 
+[0.2.5]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.5
 [0.2.4]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.4
 [0.2.3]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.3
 [0.2.2]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.2

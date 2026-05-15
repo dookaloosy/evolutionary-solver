@@ -71,15 +71,18 @@ def breed(parents, evolved_params, fixed_params, gen, n_children, alpha=0.5,
         outer = {}
 
         # BLX-α crossover for continuous
+        self_breed = p1 is p2
         for k, (lo, hi) in continuous.items():
             v1 = p1['evolved_values'][k]
             v2 = p2['evolved_values'][k]
-            d = abs(v1 - v2)
-            child_lo = min(v1, v2) - alpha * d
-            child_hi = max(v1, v2) + alpha * d
-            child_lo = max(child_lo, lo)
-            child_hi = min(child_hi, hi)
-            val = np.random.uniform(child_lo, child_hi)
+            if self_breed:
+                sigma = 0.1 * (hi - lo)
+                val = np.clip(np.random.normal(v1, sigma), lo, hi)
+            else:
+                d = abs(v1 - v2)
+                child_lo = max(min(v1, v2) - alpha * d, lo)
+                child_hi = min(max(v1, v2) + alpha * d, hi)
+                val = np.random.uniform(child_lo, child_hi)
             outer[k] = problem.round_param(k, val) if problem else val
 
         # Discrete: random pick from parents
@@ -479,7 +482,7 @@ def run_optimizer(
                 on_tick=_shared_tick_cb,
                 progress_interval=10,
                 n_workers=workers_per_cand,
-                acceptance_threshold=0,
+                acceptance_threshold=acceptance_threshold,
                 max_attempts=max_attempts,
                 worker_timeout=30,
                 max_timeouts=1,
@@ -512,12 +515,15 @@ def run_optimizer(
                     # basins are well-separated in every dimension —
                     # the pre-0.2.0 code used only axis 0 and had a
                     # latent bug when axes had dissimilar scales.
-                    _min_sep = max(2, min(
-                        int(fine_margins[ax] / (fine_steps[ax] * coarse_factor))
-                        for ax in axis_names_list
-                    ))
+                    if axis_names_list:
+                        _min_sep = max(2, min(
+                            int(fine_margins[ax] / (fine_steps[ax] * coarse_factor))
+                            for ax in axis_names_list
+                        ))
+                    else:
+                        _min_sep = 1  # 0-d grid: single point, no separation needed
                     basins_raw = problem.fitness_basins(
-                        stats, acceptance_threshold=0,
+                        stats, acceptance_threshold=acceptance_threshold,
                         n_basins=n_basins, min_separation=_min_sep)
                     if not basins_raw:
                         cand['coarse_fitness'] = 1e6
@@ -566,15 +572,22 @@ def run_optimizer(
         # selection and parent ranking after a mid-generation resume.
         coarse_ranked = sorted(
             [c for c in gen_candidates
-             if c['status'] in ('coarse_done', 'fine_done')],
+             if c['status'] in ('coarse_done', 'fine_done')
+             and c['coarse_fitness'] < 1e6],
             key=lambda c: c['coarse_fitness'])
+        penalty_cands = [
+            c for c in gen_candidates
+            if c['status'] in ('coarse_done', 'fine_done')
+            and c['coarse_fitness'] >= 1e6]
 
         n_survivors = max(2, len(coarse_ranked) // 2)
         survivors = coarse_ranked[:n_survivors]
         for c in coarse_ranked[n_survivors:]:
             c['status'] = 'culled'
+        for c in penalty_cands:
+            c['status'] = 'culled'
 
-        print(f"\nCoarse survivors ({n_survivors}/{len(gen_candidates)}):")
+        print(f"\nCoarse survivors ({len(survivors)}/{len(gen_candidates)}):")
         for c in survivors:
             n_b = len(c.get('basins', []))
             print(f"  {c['id']}: {problem.format_fitness(c['coarse_fitness'])}"
@@ -605,6 +618,13 @@ def run_optimizer(
             vr = cand['valid_range']
             for bi, basin in enumerate(basins):
                 if basin['status'] == 'fine_done':
+                    continue
+                if basin.get('coarse_fitness', 0) >= 1e6:
+                    basin['fine_fitness'] = 1e6
+                    basin['best_point'] = basin['center']
+                    basin['status'] = 'fine_done'
+                    _shared_tick_cb.clear_spinner()
+                    print(f"  {cand['id']} basin{bi}: penalty — skipped")
                     continue
                 fine_searched = _make_basin_fine_axes(basin, vr)
                 basin['output_dir'] = cand['output_dir'] + f'_basin{bi}'
@@ -691,14 +711,6 @@ def run_optimizer(
                         print(f"  {cand['id']} basin{bi}: fine fitness = "
                               f"{problem.format_fitness(alpha)}")
                     else:
-                        # No accepted points in the fine scan.  The coarse
-                        # scan uses acceptance_threshold=0 to cast a wide
-                        # net for basin discovery, so coarse_fitness may
-                        # reflect a mode that fails the acceptance filter
-                        # (e.g. low coupling efficiency).  Falling back to
-                        # coarse_fitness here would let an unacceptable
-                        # mode compete in ranking and contaminate breeding.
-                        # Assign penalty fitness instead.
                         basin['fine_fitness'] = 1e6
                         basin['best_point'] = basin['center']
                         _shared_tick_cb.clear_spinner()
