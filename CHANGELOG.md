@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-12
+
+Breaking release. Candidate-level parallelism moves from threads to
+processes — `Problem` subclasses must now be picklable. Consumers
+pinned at `>=0.2,<0.3` must bump to `>=0.3,<0.4`.
+
+### Changed (BREAKING)
+- Candidate evaluation switched from `ThreadPoolExecutor` to
+  `ProcessPoolExecutor`. Problem instances are pickled and sent to
+  worker processes. Any subclass that holds unpicklable state
+  (lambdas, open file handles, locks) must implement
+  `__getstate__`/`__setstate__` or restructure.
+- `Problem` picklability is now a documented contract of the engine.
+  Base class provides `__getstate__`/`__setstate__`.
+- Spinner/tick callbacks removed from worker processes — the parent
+  prints one line per completed future instead.
+- `n_workers` budget is now divided among `max_concurrent` candidates
+  (`workers_per_cand = n_workers // max_concurrent`). Previously each
+  candidate got the full worker pool.
+
+### Added
+- Phase 2 of `run_optimizer` tries `refine_basin()` per basin before
+  building the fine grid. When the problem provides a refinement
+  method, it bypasses the grid entirely — typically 100-200 function
+  evaluations vs thousands of grid points.
+- Fine-phase promotion (`n_fine_pts <= 1`) no longer bypasses
+  `refine_basin()`. Trivial grids are always sent to the fine phase;
+  `refine_basin()` runs first, and promotion only happens if the
+  problem declines refinement.
+- Enriched basin refinement output: start/finish prints with global
+  elapsed time, coarse->refined fitness arrow, and problem-specific
+  parameter summary via `format_best_point()`.
+- `n_workers` and `max_concurrent` documented in `run_optimizer`
+  docstring.
+
 ## [0.2.5] — 2026-05-12
 
 ### Added
@@ -25,14 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could form around zero-throughput coarse grid points, wasting
   compute on refinement of infeasible candidates.
 - Penalty candidates (`coarse_fitness >= 1e6`) excluded from survivor
-  selection. Previously the `max(2, …)` floor could promote penalty
+  selection. Previously the `max(2, ...`) floor could promote penalty
   candidates into the refinement phase, wasting compute on infeasible
   designs.
 - Per-basin penalty skip: basins with `coarse_fitness >= 1e6` skip
   the fine-grid sweep entirely.
 - Gaussian mutation for self-breed: when only one parent survives,
-  continuous params get Gaussian noise (σ = 10% of range width)
-  instead of producing identical clones (BLX-α with d=0).
+  continuous params get Gaussian noise (sigma = 10% of range width)
+  instead of producing identical clones (BLX-alpha with d=0).
 
 ## [0.2.4] — 2026-05-03
 
@@ -42,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the value outside the valid range and produce an empty grid.
 - `make_grid`: snap start/stop outward (floor/ceil to
   `grid_resolution`) before `arange`, then `np.unique` to deduplicate.
-  Unaligned fine margins (e.g. ±2.5° with 1.0° resolution) produced
+  Unaligned fine margins (e.g. +/-2.5 deg with 1.0 deg resolution) produced
   half-step values that snapped to duplicates, collapsing 6 grid
   points to 3.
 
@@ -63,9 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.2] — 2026-04-26
 
 ### Fixed
-- Coarse grid check: `len < 2` → `len == 0`. Single-point axes (pinned
+- Coarse grid check: `len < 2` -> `len == 0`. Single-point axes (pinned
   parameters) now pass through instead of being culled as "too small".
-- Fine scan: when the fine grid is 1×1 (all axes single-point or fully
+- Fine scan: when the fine grid is 1x1 (all axes single-point or fully
   clamped), promote the coarse result directly instead of re-running an
   identical sweep. Finalize candidate status immediately when all basins
   are promoted.
@@ -84,7 +119,7 @@ Breaking release. Sub-sweep dimensionality is no longer hardcoded to 2.
   `fine_margins: dict[str, float]` keyed by axis name. The old
   positional kwargs `fine_step_0, fine_step_1, fine_margin_0,
   fine_margin_1` are **removed**. Sub-sweep dimensionality follows
-  `len(problem.axis_names())`, so Problems can now expose 1, 2, 3, …
+  `len(problem.axis_names())`, so Problems can now expose 1, 2, 3, ...
   search axes.
 - Consumers pinned at `evolutionary-solver>=0.1,<0.2` must bump to
   `>=0.2,<0.3` and update their call sites to pass dicts. No in-code
@@ -101,9 +136,9 @@ Breaking release. Sub-sweep dimensionality is no longer hardcoded to 2.
   distance check inside `extract_basins` across all dimensions.
 - `_chebyshev_shell` rewritten to enumerate the shell surface
   directly instead of iterating the full `(2r+1)^ndim` cube and
-  filtering; constant-factor speedup (2–3× in 2-D, shrinking with
+  filtering; constant-factor speedup (2-3x in 2-D, shrinking with
   N). Docstring notes that proper high-N seeding needs a different
-  algorithm (KD-tree / Poisson-disk) before extending to ≥5 axes.
+  algorithm (KD-tree / Poisson-disk) before extending to >=5 axes.
 
 ### Migration
 - State-file format is unchanged: `optimizer_state.json` still
@@ -125,7 +160,7 @@ Breaking release. Sub-sweep dimensionality is no longer hardcoded to 2.
 ### Added
 - `run_optimizer(seed_candidates=...)` — optional list of known-good
   genomes injected as the first N members of gen0 ahead of LHS random
-  candidates. Remaining `pop_size − N` candidates are sampled as before
+  candidates. Remaining `pop_size - N` candidates are sampled as before
   and renumbered to follow the seeds.
 
 ### Fixed
@@ -141,7 +176,7 @@ Initial public release.
   parallel subprocess workers, eigenvalue continuation seeding, atomic
   checkpointing, adaptive timeout throttling.
 - Evolutionary optimizer (`run_optimizer`) with coarse-then-fine grid scans,
-  BLX-α crossover + mutation, multi-basin fine refinement, and Lamarckian
+  BLX-alpha crossover + mutation, multi-basin fine refinement, and Lamarckian
   feedback.
 - `Problem` protocol for plugging in domain-specific evaluators.
 - All grid quantization (`grid_resolution`) and fine-scan step/margin
@@ -150,6 +185,7 @@ Initial public release.
 - Per-run `optimizer_state.json` checkpoint format with full provenance
   (settings, candidates, generation history, fitness trajectory).
 
+[0.3.0]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.3.0
 [0.2.5]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.5
 [0.2.4]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.4
 [0.2.3]: https://github.com/dookaloosy/evolutionary-solver/releases/tag/v0.2.3

@@ -61,7 +61,18 @@ class Problem:
     engine calls these methods instead of hard-coding domain physics.
 
     Lifecycle: construct → prepare(params) → evaluate() per point.
+
+    Subclasses must be picklable — the optimizer engine sends Problem
+    instances to worker processes via ProcessPoolExecutor.
     """
+
+    # ── Pickling ─────────────────────────────────────────────────────────
+
+    def __getstate__(self):
+        return self.__dict__
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     # ── Identity ──────────────────────────────────────────────────────────
 

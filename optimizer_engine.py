@@ -16,7 +16,7 @@ from collections import OrderedDict
 
 import numpy as np
 
-from sweep_engine import run_sweep, make_grid, extract_basins, make_tick_callback
+from sweep_engine import run_sweep, make_grid, extract_basins
 
 
 # ── Population management ────────────────────────────────────────────────────
@@ -184,6 +184,67 @@ def find_winner(state):
     return min(done, key=lambda c: c['fine_fitness'])
 
 
+# ── Worker functions (module-level for pickling) ─────────────────────────────
+
+def _run_coarse_job(problem, cand_params, coarse_searched, coarse_factor,
+                    coarse_dir, n_workers, grid_resolution,
+                    acceptance_threshold, max_attempts):
+    """Run coarse sweep for one candidate. Executed in a worker process."""
+    problem.prepare(cand_params)
+    coarse_params = problem.coarsen_params(coarse_factor)
+    problem.prepare(coarse_params)
+    stats = run_sweep(
+        coarse_searched, coarse_dir, problem,
+        grid_resolution=grid_resolution,
+        on_progress=None,
+        on_tick=None,
+        progress_interval=10,
+        n_workers=n_workers,
+        acceptance_threshold=acceptance_threshold,
+        max_attempts=max_attempts,
+        worker_timeout=30,
+        max_timeouts=1,
+        export=False,
+    )
+    return stats
+
+
+def _run_fine_job(problem, cand_params, basin_center, basin_coarse_fitness,
+                  refine_bounds, refine_dir, fine_searched, basin_output_dir,
+                  n_workers, grid_resolution, acceptance_threshold,
+                  max_attempts):
+    """Run fine refinement for one basin. Executed in a worker process."""
+    problem.prepare(cand_params)
+
+    if basin_coarse_fitness >= 1e6:
+        return {'promoted': True}
+
+    refined = problem.refine_basin(basin_center, refine_bounds, refine_dir)
+    if refined is not None:
+        return {'refined': refined}
+
+    n_fine = 1
+    for a in fine_searched.values():
+        n_fine *= len(a)
+    if n_fine <= 1:
+        return {'promoted': True}
+
+    stats = run_sweep(
+        fine_searched, basin_output_dir, problem,
+        grid_resolution=grid_resolution,
+        on_progress=None,
+        on_tick=None,
+        progress_interval=10,
+        n_workers=n_workers,
+        acceptance_threshold=acceptance_threshold,
+        max_attempts=max_attempts,
+        worker_timeout=30,
+        max_timeouts=1,
+        export=False,
+    )
+    return {'stats': stats}
+
+
 # ── Main optimizer loop ──────────────────────────────────────────────────────
 
 def run_optimizer(
@@ -222,6 +283,10 @@ def run_optimizer(
         length of this dict.
     fine_margins : dict[str, float] — fine-scan zoom half-width,
         keyed by axis name. Same keying requirement as ``fine_steps``.
+    n_workers : int — total CPU budget for parallel evaluation.
+        Divided among ``max_concurrent`` candidates.
+    max_concurrent : int — how many candidates evaluate in parallel.
+        Each gets ``n_workers // max_concurrent`` inner workers.
     problem : Problem — domain adapter (must have .name set)
     """
     if grid_resolution is None or fine_steps is None or fine_margins is None:
@@ -245,9 +310,6 @@ def run_optimizer(
             f"problem.axis_names() = {axis_names_list}. "
             f"Missing in fine_steps: {sorted(missing_steps)}; "
             f"missing in fine_margins: {sorted(missing_margins)}")
-
-    import threading
-    _state_lock = threading.Lock()
 
     if run_name is None:
         run_name = f'optim_{problem.name}_{time.strftime("%Y%m%d_%H%M%S")}'
@@ -323,47 +385,6 @@ def run_optimizer(
         state['candidates'] = candidates_all
         save_state(state, run_dir)
 
-    def _make_sweep_progress(tick_cb, t0):
-        """Terminal-only progress (same format as refine, no PNG/CSV)."""
-        def on_progress(s):
-            if tick_cb and hasattr(tick_cb, 'clear_spinner'):
-                tick_cb.clear_spinner()
-            elapsed = time.perf_counter() - t0
-            # Generic acceptance counting from result maps
-            rn0 = problem.result_names[0]
-            primary = s.get(f'{rn0}_map', s.get(rn0))
-            accept_f = problem.acceptance_field
-            accept = s.get(f'{accept_f}_map', s.get(accept_f))
-            at = s.get('acceptance_threshold', 0.10)
-            converged = ~np.isnan(primary) if primary is not None else np.array([])
-            accepted = converged & (accept >= at) if accept is not None else np.array([])
-            n_accepted = int(np.sum(accepted))
-            n_converged = int(np.sum(converged))
-            n_valid = int(np.sum(s['n_attempts_map'] >= 0))
-            # Fix: a point accepted on its first attempt has n_attempts==1,
-            # which trips `>= max_attempts` when max_attempts==1. Without
-            # masking out accepted points, n_remaining goes negative.
-            max_attempts_local = s.get('max_attempts', 4)
-            attempts_exhausted = s['n_attempts_map'] >= max_attempts_local
-            if accepted.shape == attempts_exhausted.shape:
-                exhausted = attempts_exhausted & ~accepted
-            else:
-                exhausted = attempts_exhausted
-            n_remaining = n_valid - n_accepted - int(np.sum(exhausted))
-            n_timeouts = int(s['timeout_map'].sum())
-            print(f"[{elapsed:6.0f}s] "
-                  f"accepted={n_accepted}/{n_valid}  "
-                  f"converged={n_converged}  "
-                  f"remaining={n_remaining}  "
-                  f"fails={s['fail_counts']}  "
-                  f"timeouts={n_timeouts}  "
-                  f"eff={s['effective_max']}  "
-                  f"in-flight={s['in_flight']}",
-                  flush=True)
-        return on_progress
-
-    _shared_tick_cb = make_tick_callback(own_clock=True)
-
     t_start = time.perf_counter()
 
     for gen in range(gen_start, max_generations):
@@ -407,9 +428,7 @@ def run_optimizer(
         # ── Phase 1: validity pre-filter + coarse scan (parallel) ────────
         import multiprocessing
         total_workers = n_workers or max(1, int(multiprocessing.cpu_count() * 0.5))
-        # Each candidate gets the full worker pool — the OS scheduler handles
-        # contention. This avoids idle CPUs when one candidate finishes early.
-        workers_per_cand = total_workers
+        workers_per_cand = max(1, total_workers // max_concurrent)
 
         # Pre-filter and prepare candidates
         pending = []
@@ -423,7 +442,9 @@ def run_optimizer(
             cand['valid_range'] = vr
 
             if vr is None:
-                print(f"  {cand['id']}: no valid range — culled")
+                desc = problem.describe_candidate(cand)
+                suffix = f" {desc} —" if desc else " —"
+                print(f"  {cand['id']}:{suffix} no valid range, culled")
                 cand['status'] = 'culled'
                 cand['coarse_fitness'] = 1e6
                 continue
@@ -460,53 +481,44 @@ def run_optimizer(
             n_pts = 1
             for s in grid_sizes:
                 n_pts *= s
+            desc = problem.describe_candidate(cand)
+            if desc:
+                print(f"  {cand['id']}: {desc}")
             print(f"  {cand['id']}: valid {', '.join(range_strs)}  "
                   f"({' × '.join(str(s) for s in grid_sizes)} = "
                   f"{n_pts} pts)")
             pending.append((cand, coarse_searched))
 
-        # Run coarse scans in parallel batches (acceptance=0, coarser resolution, temp dir)
-        def _run_coarse(cand, coarse_searched):
-            problem.prepare(cand['full_params'])
-            coarse_params = problem.coarsen_params(coarse_factor)
-            problem.prepare(coarse_params)
-            coarse_dir = cand['output_dir'] + '_coarse'
-            _shared_tick_cb.clear_spinner()
-            print(f"  {cand['id']}: coarse scan starting "
-                  f"({workers_per_cand} workers)...")
-            on_progress = _make_sweep_progress(_shared_tick_cb, t_start)
-            stats = run_sweep(
-                coarse_searched, coarse_dir, problem,
-                grid_resolution=grid_resolution,
-                on_progress=on_progress,
-                on_tick=_shared_tick_cb,
-                progress_interval=10,
-                n_workers=workers_per_cand,
-                acceptance_threshold=acceptance_threshold,
-                max_attempts=max_attempts,
-                worker_timeout=30,
-                max_timeouts=1,
-                export=False,
-            )
-            return cand, stats
+        # Run coarse scans in parallel across candidates
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=max_concurrent) as tex:
+        print(f"\nCoarse phase: {len(pending)} candidates, "
+              f"{max_concurrent} concurrent, "
+              f"{workers_per_cand} workers/candidate")
+
+        with ProcessPoolExecutor(max_workers=max_concurrent) as pex:
             futures = {}
             pending_iter = iter(pending)
 
-            # Seed initial batch
             for _ in range(min(max_concurrent, len(pending))):
                 try:
                     cand, c_searched = next(pending_iter)
-                    futures[tex.submit(_run_coarse, cand, c_searched)] = cand
+                    coarse_dir = cand['output_dir'] + '_coarse'
+                    fut = pex.submit(
+                        _run_coarse_job, problem, cand['full_params'],
+                        c_searched, coarse_factor, coarse_dir,
+                        workers_per_cand, grid_resolution,
+                        acceptance_threshold, max_attempts)
+                    futures[fut] = cand
                 except StopIteration:
                     break
 
             while futures:
                 for fut in as_completed(futures):
                     cand = futures.pop(fut)
-                    _, stats = fut.result()
+                    stats = fut.result()
+
+                    elapsed = time.perf_counter() - t_start
 
                     # Extract top-K basins from coarse results. The
                     # min_separation is a Chebyshev distance in coarse
@@ -529,9 +541,8 @@ def run_optimizer(
                         cand['coarse_fitness'] = 1e6
                         cand['basins'] = []
                         cand['status'] = 'coarse_done'
-                        _shared_tick_cb.clear_spinner()
-                        print(f"  {cand['id']}: no accepted points — "
-                              f"fitness=penalty")
+                        print(f"[{elapsed:6.0f}s] {cand['id']}: "
+                              f"no accepted points — fitness=penalty")
                     else:
                         alpha, best_pt = basins_raw[0]
                         cand['coarse_fitness'] = alpha
@@ -546,23 +557,29 @@ def run_optimizer(
                             for a, bp in basins_raw
                         ]
                         cand['status'] = 'coarse_done'
-                        _shared_tick_cb.clear_spinner()
                         pt_strs = [
                             problem.format_point(ax, best_pt[ax])
                             for ax in axis_names_list
                         ]
-                        print(f"  {cand['id']}: coarse fitness = "
+                        print(f"[{elapsed:6.0f}s] {cand['id']}: "
+                              f"coarse fitness = "
                               f"{problem.format_fitness(alpha)} "
                               f"at {', '.join(pt_strs)}"
                               f" ({len(basins_raw)} basin(s))")
                     state['candidates'] = candidates_all
-                    with _state_lock:
-                        save_state(state, run_dir)
+                    save_state(state, run_dir)
 
                     # Submit next candidate as slot opens
                     try:
                         cand_next, c_axes = next(pending_iter)
-                        futures[tex.submit(_run_coarse, cand_next, c_searched)] = cand_next
+                        coarse_dir = cand_next['output_dir'] + '_coarse'
+                        fut_next = pex.submit(
+                            _run_coarse_job, problem,
+                            cand_next['full_params'], c_axes,
+                            coarse_factor, coarse_dir, workers_per_cand,
+                            grid_resolution, acceptance_threshold,
+                            max_attempts)
+                        futures[fut_next] = cand_next
                     except StopIteration:
                         pass
                     break  # back to as_completed
@@ -570,6 +587,8 @@ def run_optimizer(
         # ── Rank by coarse fitness, select top 50% for fine scan ─────────
         # Include fine_done candidates so they participate in survivor
         # selection and parent ranking after a mid-generation resume.
+        # Exclude penalty candidates (coarse_fitness >= 1e6) — they have
+        # no viable basins and would waste refinement slots.
         coarse_ranked = sorted(
             [c for c in gen_candidates
              if c['status'] in ('coarse_done', 'fine_done')
@@ -605,7 +624,7 @@ def run_optimizer(
                 for ax in axis_names_list
             ])
 
-        # Build flat list of (cand, basin_idx, fine_axes) jobs
+        # Build flat list of fine jobs
         fine_pending = []
         for cand in survivors:
             if cand['status'] == 'fine_done':
@@ -619,39 +638,18 @@ def run_optimizer(
             for bi, basin in enumerate(basins):
                 if basin['status'] == 'fine_done':
                     continue
-                if basin.get('coarse_fitness', 0) >= 1e6:
-                    basin['fine_fitness'] = 1e6
-                    basin['best_point'] = basin['center']
-                    basin['status'] = 'fine_done'
-                    _shared_tick_cb.clear_spinner()
-                    print(f"  {cand['id']} basin{bi}: penalty — skipped")
-                    continue
                 fine_searched = _make_basin_fine_axes(basin, vr)
                 basin['output_dir'] = cand['output_dir'] + f'_basin{bi}'
                 center = basin['center']
-                fine_sizes = [len(fine_searched[ax]) for ax in axis_names_list]
-                n_fine_pts = 1
-                for s in fine_sizes:
-                    n_fine_pts *= s
 
-                if n_fine_pts <= 1:
-                    basin['fine_fitness'] = basin['coarse_fitness']
-                    basin['best_point'] = basin['center']
-                    basin['status'] = 'fine_done'
-                    _shared_tick_cb.clear_spinner()
-                    print(f"  {cand['id']} basin{bi}: fine grid 1×1 — "
-                          f"promoted coarse result")
-                    continue
-
-                _shared_tick_cb.clear_spinner()
                 center_strs = [
                     problem.format_point(ax, center[ax])
                     for ax in axis_names_list
                 ]
-                print(f"  {cand['id']} basin{bi}: fine scan "
-                      f"{' × '.join(str(s) for s in fine_sizes)} = "
-                      f"{n_fine_pts} pts "
-                      f"(zoom around {', '.join(center_strs)})")
+                desc = problem.describe_candidate(cand)
+                desc_part = f" {desc} |" if desc else ""
+                print(f"  {cand['id']} basin{bi}:{desc_part} refine "
+                      f"({', '.join(center_strs)})")
                 fine_pending.append((cand, bi, fine_searched))
 
             # If all basins were promoted (no fine jobs queued), finalize now.
@@ -665,57 +663,95 @@ def run_optimizer(
                     cand['best_point'] = best_b['best_point']
                 cand['status'] = 'fine_done'
 
-        def _run_fine(cand, basin_idx, fine_searched):
-            problem.prepare(cand['full_params'])
-            basin = cand['basins'][basin_idx]
-            _shared_tick_cb.clear_spinner()
-            print(f"  {cand['id']} basin{basin_idx}: fine scan starting "
-                  f"({workers_per_cand} workers)...")
-            on_progress = _make_sweep_progress(_shared_tick_cb, t_start)
-            stats = run_sweep(
-                fine_searched, basin['output_dir'], problem,
-                grid_resolution=grid_resolution,
-                on_progress=on_progress,
-                on_tick=_shared_tick_cb,
-                progress_interval=10,
-                n_workers=workers_per_cand,
-                acceptance_threshold=acceptance_threshold,
-                max_attempts=max_attempts,
-                worker_timeout=30,
-                max_timeouts=1,
-                export=False,
-            )
-            return cand, basin_idx, stats
+        print(f"\nFine phase: {len(fine_pending)} basins, "
+              f"{max_concurrent} concurrent, "
+              f"{workers_per_cand} workers/candidate")
 
-        with ThreadPoolExecutor(max_workers=max_concurrent) as tex:
+        with ProcessPoolExecutor(max_workers=max_concurrent) as pex:
             futures = {}
             fine_iter = iter(fine_pending)
 
             for _ in range(min(max_concurrent, len(fine_pending))):
                 try:
                     cand, bi, f_axes = next(fine_iter)
-                    futures[tex.submit(_run_fine, cand, bi, f_axes)] = (cand, bi)
+                    basin = cand['basins'][bi]
+                    vr = cand['valid_range']
+                    refine_bounds = {
+                        ax: (vr[f'{ax}_min'], vr[f'{ax}_max'])
+                        for ax in axis_names_list
+                    }
+                    refine_dir = basin.get(
+                        'output_dir',
+                        cand['output_dir'] + f'_basin{bi}')
+                    fut = pex.submit(
+                        _run_fine_job, problem, cand['full_params'],
+                        basin['center'], basin.get('coarse_fitness', 0),
+                        refine_bounds, refine_dir, f_axes,
+                        basin['output_dir'], workers_per_cand,
+                        grid_resolution, acceptance_threshold,
+                        max_attempts)
+                    futures[fut] = (cand, bi)
                 except StopIteration:
                     break
 
             while futures:
                 for fut in as_completed(futures):
                     cand, bi = futures.pop(fut)
-                    _, _, stats = fut.result()
+                    result = fut.result()
                     basin = cand['basins'][bi]
-                    alpha, best_pt = problem.fitness(stats, acceptance_threshold)
-                    if alpha is not None:
-                        basin['fine_fitness'] = alpha
-                        basin['best_point'] = best_pt
-                        _shared_tick_cb.clear_spinner()
-                        print(f"  {cand['id']} basin{bi}: fine fitness = "
-                              f"{problem.format_fitness(alpha)}")
+                    elapsed = time.perf_counter() - t_start
+
+                    if 'refined' in result:
+                        alpha, best_pt = result['refined']
+                        if alpha is not None and alpha < 1e6:
+                            basin['fine_fitness'] = alpha
+                            basin['best_point'] = best_pt
+                            coarse_f = basin.get('coarse_fitness', None)
+                            coarse_str = (problem.format_fitness(coarse_f)
+                                          if coarse_f is not None else '?')
+                            param_info = problem.format_best_point(
+                                best_pt)
+                            if param_info:
+                                param_info = f" {param_info}"
+                            print(f"[{elapsed:6.0f}s] {cand['id']} basin{bi}: "
+                                  f"{coarse_str} → "
+                                  f"{problem.format_fitness(alpha)}"
+                                  f"{param_info}")
+                        else:
+                            basin['fine_fitness'] = 1e6
+                            basin['best_point'] = basin['center']
+                            print(f"[{elapsed:6.0f}s] {cand['id']} basin{bi}: "
+                                  f"refine_basin failed — penalty")
+                    elif 'promoted' in result:
+                        basin['fine_fitness'] = basin['coarse_fitness']
+                        basin['best_point'] = basin.get(
+                            'best_point') or basin['center']
+                        print(f"[{elapsed:6.0f}s] {cand['id']} basin{bi}: "
+                              f"promoted coarse")
                     else:
-                        basin['fine_fitness'] = 1e6
-                        basin['best_point'] = basin['center']
-                        _shared_tick_cb.clear_spinner()
-                        print(f"  {cand['id']} basin{bi}: "
-                              f"fine scan no accepted points — penalty")
+                        stats = result['stats']
+                        alpha, best_pt = problem.fitness(
+                            stats, acceptance_threshold)
+                        if alpha is not None:
+                            basin['fine_fitness'] = alpha
+                            basin['best_point'] = best_pt
+                            coarse_f = basin.get('coarse_fitness', None)
+                            coarse_str = (problem.format_fitness(coarse_f)
+                                          if coarse_f is not None else '?')
+                            param_info = problem.format_best_point(
+                                best_pt)
+                            if param_info:
+                                param_info = f" {param_info}"
+                            print(f"[{elapsed:6.0f}s] {cand['id']} basin{bi}: "
+                                  f"{coarse_str} → "
+                                  f"{problem.format_fitness(alpha)}"
+                                  f"{param_info}")
+                        else:
+                            basin['fine_fitness'] = 1e6
+                            basin['best_point'] = basin['center']
+                            print(f"[{elapsed:6.0f}s] {cand['id']} basin{bi}: "
+                                  f"fine scan no accepted points — penalty")
+
                     basin['status'] = 'fine_done'
 
                     # Update candidate top-level from best basin so far
@@ -733,13 +769,29 @@ def run_optimizer(
                         cand['status'] = 'fine_done'
 
                     state['candidates'] = candidates_all
-                    with _state_lock:
-                        save_state(state, run_dir)
+                    save_state(state, run_dir)
 
                     try:
                         cand_next, bi_next, f_searched = next(fine_iter)
-                        futures[tex.submit(_run_fine, cand_next, bi_next,
-                                           f_searched)] = (cand_next, bi_next)
+                        basin_next = cand_next['basins'][bi_next]
+                        vr_next = cand_next['valid_range']
+                        refine_bounds_next = {
+                            ax: (vr_next[f'{ax}_min'], vr_next[f'{ax}_max'])
+                            for ax in axis_names_list
+                        }
+                        refine_dir_next = basin_next.get(
+                            'output_dir',
+                            cand_next['output_dir'] + f'_basin{bi_next}')
+                        fut_next = pex.submit(
+                            _run_fine_job, problem,
+                            cand_next['full_params'],
+                            basin_next['center'],
+                            basin_next.get('coarse_fitness', 0),
+                            refine_bounds_next, refine_dir_next,
+                            f_searched, basin_next['output_dir'],
+                            workers_per_cand, grid_resolution,
+                            acceptance_threshold, max_attempts)
+                        futures[fut_next] = (cand_next, bi_next)
                     except StopIteration:
                         pass
                     break
@@ -842,8 +894,7 @@ def run_optimizer(
 
             candidates_all.extend(new_candidates)
             state['candidates'] = candidates_all
-            with _state_lock:
-                        save_state(state, run_dir)
+            save_state(state, run_dir)
 
     # ── Final summary ────────────────────────────────────────────────────
     all_done = [c for c in candidates_all

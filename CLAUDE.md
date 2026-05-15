@@ -38,6 +38,8 @@ Subclass `Problem` from `sweep_engine` and implement:
 - `coarsen_params(factor)` — return params for coarse evaluation
 - `round_param(name, value)` — rounding precision for evolved params
 - `format_fitness(value)`, `format_point(name, value)`, `format_bounds(name, lo, hi, unit)` — display
+- `format_best_point(best_point)` — parenthesised summary of refined params for basin result display
+- `refine_basin(center, bounds, output_dir)` — continuous refinement (e.g. Nelder-Mead) on a basin; return `(fitness, best_point)` or `None`
 - `extra_stats(searched_axes)` — domain-specific entries for stats dict
 - `export_results(output_dir, searched_axes, stats)` — CSV/PNG exports
 
